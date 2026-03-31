@@ -1,0 +1,10 @@
+torch
+numpy
+diffusers
+huggingface_hub
+transformers
+accelerate
+imageio
+imageio-ffmpeg
+opencv-python
+zstandard

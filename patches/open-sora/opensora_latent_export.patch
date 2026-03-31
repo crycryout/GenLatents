@@ -1,0 +1,149 @@
+diff --git a/opensora/models/mmdit/math.py b/opensora/models/mmdit/math.py
+index f09cd97..f13a0ae 100644
+--- a/opensora/models/mmdit/math.py
++++ b/opensora/models/mmdit/math.py
+@@ -1,22 +1,36 @@
+ import torch
+ from einops import rearrange
+-from flash_attn import flash_attn_func as flash_attn_func_v2
+ from liger_kernel.ops.rope import LigerRopeFunction
+ from torch import Tensor
+ from typing import Tuple
+ 
++try:
++    from flash_attn import flash_attn_func as flash_attn_func_v2
++
++    SUPPORT_FA2 = True
++except Exception:
++    SUPPORT_FA2 = False
++
+ try:
+     from flash_attn_interface import flash_attn_func as flash_attn_func_v3
+ 
+     SUPPORT_FA3 = True
+-except:
++except Exception:
+     SUPPORT_FA3 = False
+ 
+ 
+ def flash_attn_func(q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+     if SUPPORT_FA3:
+         return flash_attn_func_v3(q, k, v)[0]
+-    return flash_attn_func_v2(q, k, v)
++    if SUPPORT_FA2:
++        return flash_attn_func_v2(q, k, v)
++    return torch.nn.functional.scaled_dot_product_attention(
++        q.transpose(1, 2),
++        k.transpose(1, 2),
++        v.transpose(1, 2),
++        dropout_p=0.0,
++        is_causal=False,
++    ).transpose(1, 2)
+ 
+ 
+ def attention(q: Tensor, k: Tensor, v: Tensor, pe) -> Tensor:
+diff --git a/opensora/utils/cai.py b/opensora/utils/cai.py
+index 090ba78..654dd83 100644
+--- a/opensora/utils/cai.py
++++ b/opensora/utils/cai.py
+@@ -9,8 +9,6 @@ from opensora.acceleration.parallel_states import (
+     get_tensor_parallel_group,
+     set_sequence_parallel_group,
+ )
+-from opensora.models.hunyuan_vae.policy import HunyuanVaePolicy
+-from opensora.models.mmdit.distributed import MMDiTPolicy
+ from opensora.utils.logger import is_distributed
+ from opensora.utils.train import create_colossalai_plugin
+ 
+@@ -50,13 +48,16 @@ def init_inference_environment():
+ 
+ def get_booster(cfg: dict, ae: bool = False):
+     suffix = "_ae" if ae else ""
+-    policy = HunyuanVaePolicy if ae else MMDiTPolicy
+ 
+     plugin_type = cfg.get(f"plugin{suffix}", "zero2")
+     plugin_config = cfg.get(f"plugin_config{suffix}", {})
+     plugin_kwargs = {}
+     booster = None
+     if plugin_type == "hybrid":
++        from opensora.models.hunyuan_vae.policy import HunyuanVaePolicy
++        from opensora.models.mmdit.distributed import MMDiTPolicy
++
++        policy = HunyuanVaePolicy if ae else MMDiTPolicy
+         set_group_size(plugin_config)
+         plugin_kwargs = dict(custom_policy=policy)
+ 
+diff --git a/opensora/utils/ckpt.py b/opensora/utils/ckpt.py
+index 1065a27..98e39a0 100644
+--- a/opensora/utils/ckpt.py
++++ b/opensora/utils/ckpt.py
+@@ -16,7 +16,15 @@ from colossalai.utils.safetensors import save as async_save
+ from colossalai.zero.low_level import LowLevelZeroOptimizer
+ from huggingface_hub import hf_hub_download
+ from safetensors.torch import load_file
+-from tensornvme.async_file_io import AsyncFileWriter
++try:
++    from tensornvme.async_file_io import AsyncFileWriter
++except Exception:
++    # Inference does not rely on TensorNVMe's async checkpoint writer.
++    # Keep a lightweight fallback so environments with newer/trimmed
++    # tensornvme packages can still import inference code paths.
++    class AsyncFileWriter:  # type: ignore[no-redef]
++        def synchronize(self):
++            return None
+ from torch.optim import Optimizer
+ from torch.optim.lr_scheduler import _LRScheduler
+ 
+diff --git a/opensora/utils/sampling.py b/opensora/utils/sampling.py
+index 2059409..43fe6d7 100644
+--- a/opensora/utils/sampling.py
++++ b/opensora/utils/sampling.py
+@@ -589,6 +589,7 @@ def prepare_api(
+         neg: list[str] = None,
+         patch_size: int = 2,
+         channel: int = 16,
++        save_latents_path: str = None,
+         **kwargs,
+     ):
+         """
+@@ -706,6 +707,19 @@ def prepare_api(
+             x[0, :, :1] = references[0][0]
+             x[0, :, -1:] = references[0][1]
+ 
++        if save_latents_path is not None:
++            torch.save(
++                {
++                    "latents": x.detach().cpu(),
++                    "cond_type": cond_type,
++                    "seed": seed,
++                    "height": opt.height,
++                    "width": opt.width,
++                    "num_frames": opt.num_frames,
++                },
++                save_latents_path,
++            )
++
+         x = model_ae.decode(x)
+         x = x[:, :, : opt.num_frames]  # image
+ 
+diff --git a/scripts/diffusion/inference.py b/scripts/diffusion/inference.py
+index 221ed2d..6424340 100644
+--- a/scripts/diffusion/inference.py
++++ b/scripts/diffusion/inference.py
+@@ -223,6 +223,8 @@ def main():
+                     batch["text"] = add_motion_score_to_text(batch.pop("text"), cfg.get("motion_score", 5))
+ 
+                 logger.info("Generating video...")
++                latent_index = batch["index"][0] + start_index if "index" in batch else epoch
++                save_latents_path = os.path.join(save_dir, sub_dir, f"sample_{latent_index}_latents.pt")
+                 x = api_fn(
+                     sampling_option,
+                     cond_type,
+@@ -230,6 +232,7 @@ def main():
+                     patch_size=cfg.get("patch_size", 2),
+                     save_prefix=cfg.get("save_prefix", ""),
+                     channel=cfg["model"]["in_channels"],
++                    save_latents_path=save_latents_path,
+                     **batch,
+                 ).cpu()
+ 
