@@ -16,5 +16,6 @@ __pycache__/
 logs/
 outputs/
 runs/
-results/
 .DS_Store
+!examples/results/
+!examples/results/*.json
